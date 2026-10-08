@@ -173,6 +173,10 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     Node && Node.prototype ? lookupGetter(Node.prototype, 'nodeType') : null;
   const getNodeName =
     Node && Node.prototype ? lookupGetter(Node.prototype, 'nodeName') : null;
+  const getOwnerDocument =
+    Node && Node.prototype
+      ? lookupGetter(Node.prototype, 'ownerDocument')
+      : null;
 
   // As per issue #47, the web-components registry is inherited by a
   // new document created via createHTMLDocument. As per the spec
@@ -1185,8 +1189,17 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
    * @return The created NodeIterator
    */
   const _createNodeIterator = function (root: Node): NodeIterator {
+    /* Read ownerDocument through the cached Node.prototype getter, never the
+       direct property. HTMLFormElement has [LegacyOverrideBuiltIns], so a
+       clobbering child (<input name="ownerDocument"> or a form-associated
+       external input) shadows the prototype getter and makes a direct read
+       return that <input>. createNodeIterator.call(<input>, ...) then throws
+       "Illegal invocation" before the walk starts - leaving the caller's
+       live IN_PLACE tree, with any already-armed handler in it, unsanitized.
+       The cached getter returns the real Document regardless of the clobber. */
+    const doc = getOwnerDocument ? getOwnerDocument(root) : root.ownerDocument;
     return createNodeIterator.call(
-      root.ownerDocument || root,
+      doc || root,
       root,
       // eslint-disable-next-line no-bitwise
       NodeFilter.SHOW_ELEMENT |
@@ -1219,8 +1232,12 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
    */
   const _scrubTemplateExpressions = function (node: Element): void {
     node.normalize();
+    /* Clobber-safe ownerDocument read, same reasoning as _createNodeIterator:
+       under SAFE_FOR_TEMPLATES this runs on the live IN_PLACE root, which may
+       carry a form-named-getter override of ownerDocument. */
+    const doc = getOwnerDocument ? getOwnerDocument(node) : node.ownerDocument;
     const walker = createNodeIterator.call(
-      node.ownerDocument || node,
+      doc || node,
       node,
       // eslint-disable-next-line no-bitwise
       NodeFilter.SHOW_TEXT |
@@ -1242,14 +1259,28 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
 
     // NodeIterator does not descend into <template>.content per the DOM spec,
     // so we must explicitly recurse into each template's content fragment,
-    // mirroring the approach used by _sanitizeShadowDOM.
-    const templates = node.querySelectorAll?.('template');
-    if (templates) {
-      arrayForEach(templates, (tmpl: HTMLTemplateElement) => {
-        if (_isDocumentFragment(tmpl.content)) {
-          _scrubTemplateExpressions(tmpl.content as unknown as Element);
-        }
-      });
+    // mirroring the approach used by _sanitizeShadowDOM. The templates are
+    // found with an element-only NodeIterator from the same clobber-safe
+    // document rather than node.querySelectorAll('template'): on the live
+    // IN_PLACE root that call is not clobber-safe - a form named-getter can
+    // shadow it, and some DOM implementations (e.g. jsdom) resolve the
+    // selector engine's document through the root's own, clobberable
+    // ownerDocument property, so the scrub would throw on such a root.
+    const elementWalker = createNodeIterator.call(
+      doc || node,
+      node,
+      NodeFilter.SHOW_ELEMENT,
+      null
+    );
+
+    let element = elementWalker.nextNode() as Element | null;
+    while (element) {
+      const content = (element as HTMLTemplateElement).content;
+      if (element !== node && _isDocumentFragment(content)) {
+        _scrubTemplateExpressions(content as unknown as Element);
+      }
+
+      element = elementWalker.nextNode() as Element | null;
     }
   };
 
@@ -1416,19 +1447,108 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
   }
 
   /**
+   * _stripDisallowedAttributes
+   *
+   * Removes every attribute the active configuration does not allow from a
+   * single element, using the same allowlist as the main attribute pass (so
+   * `on*` handlers go, but no separate `/^on/` blocklist is introduced). Used
+   * only to neutralise nodes that have left an in-place tree.
+   *
+   * @param element the element to strip
+   */
+  const _stripDisallowedAttributes = function (element: Element): void {
+    const attributes = getAttributes(element);
+    if (!attributes) {
+      return;
+    }
+
+    for (let i = attributes.length - 1; i >= 0; --i) {
+      const attribute = attributes[i];
+      const name = attribute && attribute.name;
+      if (typeof name !== 'string') {
+        continue;
+      }
+
+      const lcName = transformCaseFunc(name);
+      if (ALLOWED_ATTR[lcName] && !FORBID_ATTR[lcName]) {
+        continue;
+      }
+
+      try {
+        element.removeAttribute(name);
+      } catch (_) {
+        /* Clobbered removeAttribute on a discarded node - ignore */
+      }
+    }
+  };
+
+  /**
+   * _neutralizeSubtree
+   *
+   * Walks a subtree that a hook detached from the caller's LIVE in-place tree
+   * and strips every attribute the active configuration does not allow. The
+   * walker never descends into a detached subtree, and hook-detached nodes
+   * are not recorded in DOMPurify.removed, so without this pass a descendant
+   * that was already loading (an `<img onerror>`/`<video>` built by the caller
+   * in the live document) keeps its queued resource-event handler, which
+   * fires in page scope after sanitize returns even though the returned tree
+   * is clean. Runs synchronously before sanitize returns, i.e. before any
+   * queued event can fire. Hook-free by design: these nodes leave the output,
+   * so firing attribute hooks for them would be surprising. Clobber-safe
+   * reads throughout.
+   *
+   * @param root the root of a detached subtree to neutralise
+   */
+  const _neutralizeSubtree = function (root: Node): void {
+    const stack: Node[] = [root];
+
+    while (stack.length > 0) {
+      const node: Node = arrayPop(stack);
+      const nodeType = getNodeType ? getNodeType(node) : node.nodeType;
+
+      if (nodeType === NODE_TYPE.element) {
+        _stripDisallowedAttributes(node as Element);
+      }
+
+      const childNodes = getChildNodes(node);
+      if (childNodes) {
+        for (let i = childNodes.length - 1; i >= 0; --i) {
+          arrayPush(stack, childNodes[i]);
+        }
+      }
+    }
+  };
+
+  /**
    * _sanitizeElements
    *
    * @protect nodeName
    * @protect textContent
    * @protect removeChild
    * @param currentNode to check for permission to exist
+   * @param root the root node of the current walk
    * @return true if node was killed, false if left alive
    */
-  const _sanitizeElements = function (currentNode: any): boolean {
+  const _sanitizeElements = function (currentNode: any, root: Node): boolean {
     let content = null;
 
     /* Execute a hook if present */
     _executeHooks(hooks.beforeSanitizeElements, currentNode, null);
+
+    /* A hook may have detached the node. The walker will not descend into a
+       detached subtree, and hook-detached nodes are not recorded in
+       DOMPurify.removed, so on the IN_PLACE path neutralize the detached
+       subtree first - a queued resource handler on one of its descendants
+       must not fire in page scope after we return. The walk root is exempt:
+       a detached IN_PLACE root is legitimate input and is sanitized by the
+       walk itself. */
+    if (
+      IN_PLACE &&
+      currentNode !== root &&
+      getParentNode(currentNode) === null
+    ) {
+      _neutralizeSubtree(currentNode);
+    }
 
     /* Check if element is clobbered or can clobber */
     if (_isClobbered(currentNode)) {
@@ -1446,6 +1566,18 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       tagName,
       allowedTags: ALLOWED_TAGS,
     });
+
+    /* Same as after the beforeSanitizeElements hook above: an
+       uponSanitizeElement hook that detaches the node (the documented
+       node.remove() pattern) takes its subtree out of the walk, so on the
+       IN_PLACE path neutralize that subtree inline before continuing. */
+    if (
+      IN_PLACE &&
+      currentNode !== root &&
+      getParentNode(currentNode) === null
+    ) {
+      _neutralizeSubtree(currentNode);
+    }
 
     /* Detect mXSS attempts abusing namespace confusion */
     if (
@@ -1917,7 +2049,7 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       _executeHooks(hooks.uponSanitizeShadowNode, shadowNode, null);
 
       /* Sanitize tags and elements */
-      _sanitizeElements(shadowNode);
+      _sanitizeElements(shadowNode, fragment);
 
       /* Check attributes next */
       _sanitizeAttributes(shadowNode);
@@ -2209,12 +2341,13 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     }
 
     /* Get node iterator */
-    const nodeIterator = _createNodeIterator(inPlace ? dirty : body);
+    const walkRoot: Node = inPlace ? (dirty as Node) : body;
+    const nodeIterator = _createNodeIterator(walkRoot);
 
     /* Now start iterating over the created document */
     while ((currentNode = nodeIterator.nextNode())) {
       /* Sanitize tags and elements */
-      _sanitizeElements(currentNode);
+      _sanitizeElements(currentNode, walkRoot);
 
       /* Check attributes next */
       _sanitizeAttributes(currentNode);
